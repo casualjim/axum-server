@@ -1,0 +1,13 @@
+{
+  "rust-analyzer.cargo.features": [
+    "tls-rustls"
+  ],
+  "rust-analyzer.rustfmt.overrideCommand": [
+    "rustfmt",
+    "+nightly",
+    "--edition=2021"
+  ],
+  "rust-analyzer.runnables.extraArgs": [
+    "--all-features"
+  ]
+}
