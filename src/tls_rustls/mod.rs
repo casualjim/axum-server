@@ -33,8 +33,12 @@ use crate::{
     server::{io_other, Server},
 };
 use arc_swap::ArcSwap;
-use rustls::{Certificate, PrivateKey, ServerConfig};
-use std::time::Duration;
+use rustls::{
+    crypto,
+    pki_types::{CertificateDer, PrivateKeyDer},
+    ServerConfig,
+};
+use std::{convert::TryInto, time::Duration};
 use std::{fmt, io, net::SocketAddr, path::Path, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -172,9 +176,14 @@ impl RustlsConfig {
     ///
     /// The private key must be DER-encoded ASN.1 in either PKCS#8 or PKCS#1 format.
     pub async fn from_der(cert: Vec<Vec<u8>>, key: Vec<u8>) -> io::Result<Self> {
-        let server_config = spawn_blocking(|| config_from_der(cert, key))
-            .await
-            .unwrap()?;
+        let server_config = spawn_blocking(move || {
+            config_from_der(
+                cert.into_iter().map(Into::into).collect(),
+                load_rustls_private_key(&key)?,
+            )
+        })
+        .await
+        .unwrap()?;
         let inner = Arc::new(ArcSwap::from_pointee(server_config));
 
         Ok(Self { inner })
@@ -218,9 +227,14 @@ impl RustlsConfig {
     ///
     /// The private key must be DER-encoded ASN.1 in either PKCS#8 or PKCS#1 format.
     pub async fn reload_from_der(&self, cert: Vec<Vec<u8>>, key: Vec<u8>) -> io::Result<()> {
-        let server_config = spawn_blocking(|| config_from_der(cert, key))
-            .await
-            .unwrap()?;
+        let server_config = spawn_blocking(move || {
+            config_from_der(
+                cert.into_iter().map(Into::into).collect(),
+                load_rustls_private_key(&key)?,
+            )
+        })
+        .await
+        .unwrap()?;
         let inner = Arc::new(server_config);
 
         self.inner.store(inner);
@@ -265,12 +279,19 @@ impl fmt::Debug for RustlsConfig {
     }
 }
 
-fn config_from_der(cert: Vec<Vec<u8>>, key: Vec<u8>) -> io::Result<ServerConfig> {
-    let cert = cert.into_iter().map(Certificate).collect();
-    let key = PrivateKey(key);
+fn config_from_der(
+    cert: Vec<CertificateDer<'static>>,
+    key: PrivateKeyDer<'static>,
+) -> io::Result<ServerConfig> {
+    let cert = cert.into_iter().map(Into::into).collect();
+
+    let key = key
+        .try_into()
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
+
+    let _ = crypto::ring::default_provider().install_default();
 
     let mut config = ServerConfig::builder()
-        .with_safe_defaults()
         .with_no_client_auth()
         .with_single_cert(cert, key)
         .map_err(io_other)?;
@@ -283,13 +304,41 @@ fn config_from_der(cert: Vec<Vec<u8>>, key: Vec<u8>) -> io::Result<ServerConfig>
 fn config_from_pem(cert: Vec<u8>, key: Vec<u8>) -> io::Result<ServerConfig> {
     use rustls_pemfile::Item;
 
-    let cert = rustls_pemfile::certs(&mut cert.as_ref())?;
+    let cert = rustls_pemfile::certs(&mut cert.as_ref())
+        .into_iter()
+        .try_fold(vec![], |mut unrolled, result| {
+            unrolled.push(result?);
+            Ok::<_, io::Error>(unrolled)
+        })?;
     let key = match rustls_pemfile::read_one(&mut key.as_ref())? {
-        Some(Item::RSAKey(key)) | Some(Item::PKCS8Key(key)) | Some(Item::ECKey(key)) => key,
+        Some(Item::Pkcs1Key(key)) => PrivateKeyDer::Pkcs1(key),
+        Some(Item::Pkcs8Key(key)) => PrivateKeyDer::Pkcs8(key),
+        Some(Item::Sec1Key(key)) => PrivateKeyDer::Sec1(key),
         _ => return Err(io_other("private key format not supported")),
     };
 
     config_from_der(cert, key)
+}
+
+fn load_rustls_private_key(key: &[u8]) -> io::Result<PrivateKeyDer<'static>> {
+    let mut cursor = io::Cursor::new(key);
+    // First attempt to load the private key assuming it is PKCS8-encoded
+    if let Some(Ok(key)) = rustls_pemfile::pkcs8_private_keys(&mut cursor).next() {
+        return Ok(PrivateKeyDer::Pkcs8(key));
+    }
+
+    // If it not, try loading the private key as an RSA key
+
+    cursor.set_position(0);
+    if let Some(Ok(key)) = rustls_pemfile::rsa_private_keys(&mut cursor).next() {
+        return Ok(PrivateKeyDer::Pkcs1(key));
+    }
+
+    // Otherwise we have a Private Key parsing problem
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        "Invalid private key format",
+    ))
 }
 
 async fn config_from_pem_file(
@@ -316,16 +365,12 @@ mod tests {
         Body,
     };
     use rustls::{
-        client::{ServerCertVerified, ServerCertVerifier},
-        Certificate, ClientConfig, ServerName,
+        client::danger::{ServerCertVerified, ServerCertVerifier},
+        crypto::{verify_tls12_signature, verify_tls13_signature},
+        pki_types::{CertificateDer, ServerName},
+        ClientConfig, Error,
     };
-    use std::{
-        convert::TryFrom,
-        io,
-        net::SocketAddr,
-        sync::Arc,
-        time::{Duration, SystemTime},
-    };
+    use std::{convert::TryFrom, io, net::SocketAddr, sync::Arc, time::Duration};
     use tokio::time::sleep;
     use tokio::{net::TcpStream, task::JoinHandle, time::timeout};
     use tokio_rustls::TlsConnector;
@@ -511,7 +556,7 @@ mod tests {
         (handle, server_task, addr)
     }
 
-    async fn get_first_cert(addr: SocketAddr) -> Certificate {
+    async fn get_first_cert(addr: SocketAddr) -> CertificateDer<'static> {
         let stream = TcpStream::connect(addr).await.unwrap();
         let tls_stream = tls_connector().connect(dns_name(), stream).await.unwrap();
 
@@ -548,24 +593,60 @@ mod tests {
     }
 
     fn tls_connector() -> TlsConnector {
+        #[derive(Debug)]
         struct NoVerify;
 
         impl ServerCertVerifier for NoVerify {
             fn verify_server_cert(
                 &self,
-                _end_entity: &Certificate,
-                _intermediates: &[Certificate],
-                _server_name: &ServerName,
-                _scts: &mut dyn Iterator<Item = &[u8]>,
+                _end_entity: &CertificateDer<'_>,
+                _intermediates: &[CertificateDer<'_>],
+                _server_name: &rustls::pki_types::ServerName<'_>,
                 _ocsp_response: &[u8],
-                _now: SystemTime,
+                _now: rustls::pki_types::UnixTime,
             ) -> Result<ServerCertVerified, rustls::Error> {
                 Ok(ServerCertVerified::assertion())
+            }
+
+            fn verify_tls12_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> std::prelude::v1::Result<rustls::client::danger::HandshakeSignatureValid, Error>
+            {
+                verify_tls12_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+
+            fn verify_tls13_signature(
+                &self,
+                message: &[u8],
+                cert: &CertificateDer<'_>,
+                dss: &rustls::DigitallySignedStruct,
+            ) -> std::prelude::v1::Result<rustls::client::danger::HandshakeSignatureValid, Error>
+            {
+                verify_tls13_signature(
+                    message,
+                    cert,
+                    dss,
+                    &rustls::crypto::ring::default_provider().signature_verification_algorithms,
+                )
+            }
+
+            fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+                rustls::crypto::ring::default_provider()
+                    .signature_verification_algorithms
+                    .supported_schemes()
             }
         }
 
         let mut client_config = ClientConfig::builder()
-            .with_safe_defaults()
+            .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerify))
             .with_no_client_auth();
 
@@ -574,7 +655,7 @@ mod tests {
         TlsConnector::from(Arc::new(client_config))
     }
 
-    fn dns_name() -> ServerName {
+    fn dns_name() -> ServerName<'static> {
         ServerName::try_from("localhost").unwrap()
     }
 }
